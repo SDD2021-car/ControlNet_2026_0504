@@ -6,10 +6,11 @@ from tutorial_dataset import MyDataset
 from cldm.logger import ImageLogger
 from cldm.model import create_model, load_state_dict
 from pytorch_lightning.callbacks import ModelCheckpoint
-
+from omegaconf import OmegaConf
 
 # Configs
-resume_path = '/data/hjf/TextDiff/ControlNet-main/models/control_sd15_ini.ckpt'
+config_path = './models/cldm_v15.yaml'
+resume_path = '/NAS_data/yjy/Controlnet_2026_0504/models/control_sd15_ini.ckpt'
 batch_size = 2
 logger_freq = 800
 learning_rate = 1e-5
@@ -18,20 +19,24 @@ only_mid_control = False
 
 
 # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
-model = create_model('./models/cldm_v15.yaml').cpu()
-model.load_state_dict(load_state_dict(resume_path, location='cpu'))
+model = create_model(config_path).cpu()
+missing_keys, unexpected_keys = model.load_state_dict(load_state_dict(resume_path, location='cpu'), strict=False)
+print(f'Missing keys when loading checkpoint: {missing_keys}')
+print(f'Unexpected keys when loading checkpoint: {unexpected_keys}')
 model.learning_rate = learning_rate
 model.sd_locked = sd_locked
 model.only_mid_control = only_mid_control
 
 
 # Misc
-dataset = MyDataset()
+config = OmegaConf.load(config_path)
+dataset_params = OmegaConf.to_container(config.get('data', {}).get('params', {}), resolve=True)
+dataset = MyDataset(**dataset_params)
 dataloader = DataLoader(dataset, num_workers=2, batch_size=batch_size, shuffle=True)
 logger = ImageLogger(batch_frequency=logger_freq)
 checkpoint_callback = ModelCheckpoint(
                 filename='epoch_{epoch:03d}-step_{step}',
-                dirpath='/NAS_data/hjf/ControlNet-main/checkpoints/GF3',
+                dirpath='/NAS_data/hjf/ControlNet-main/checkpoints_color_hints/sar2opt',
                 every_n_epochs=10,
                 save_weights_only=False,
                 save_top_k=-1  # 保存所有检查点，不限制数量

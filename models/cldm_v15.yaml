@@ -9,6 +9,7 @@ model:
     first_stage_key: "jpg"
     cond_stage_key: "txt"
     control_key: "hint"
+    color_hint_key: "color_hint"
     image_size: 64
     channels: 4
     cond_stage_trainable: false
@@ -24,6 +25,8 @@ model:
         image_size: 32 # unused
         in_channels: 4
         hint_channels: 3
+        color_hint_channels: 4  # RGB color_hint + 1-channel mask
+        color_hint_patch_size: 8
         model_channels: 320
         attention_resolutions: [ 4, 2, 1 ]
         num_res_blocks: 2
@@ -60,7 +63,7 @@ model:
         ddconfig:
           double_z: true
           z_channels: 4
-          resolution: 256
+          resolution: 512
           in_channels: 3
           out_ch: 3
           ch: 128
@@ -79,3 +82,17 @@ model:
       target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
       params:
         version: "/data/yjy_data/ControlNet_new/clip-vit-large-patch14"
+
+
+# Dataset paths used by tutorial_train.py.
+# JSON rows may optionally contain "color_hint" and "mask" filenames; if absent,
+# the loader reuses the trainA filename under color_hint_root and mask_root.
+data:
+  params:
+    json_path: "/data/hjf/TextDiff/datasets/sar2opt/metadata.jsonl"
+    source_root: "/data/hjf/TextDiff/datasets/sar2opt/trainA"
+    target_root: "/data/hjf/TextDiff/datasets/sar2opt/trainB"
+    color_hint_root: "/data/yjy_data/SAM2/hint_outputs_train/color_hint_by_dots"
+    mask_root: "/data/yjy_data/SAM2/hint_outputs_train/hint_mask_binary"
+    image_size: 512
+    default_prompt: "an image"
