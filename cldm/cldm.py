@@ -45,6 +45,81 @@ class ControlledUnetModel(UNetModel):
         return self.out(h)
 
 
+
+class MaskGuidedEmbedding(nn.Module):
+    """Partial-convolution style patch embedding for sparse RGB color priors."""
+
+    def __init__(self, patch_size: int = 8, embed_dim: int = 384, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.eps = eps
+
+        self.color_proj = nn.Conv2d(
+            in_channels=3,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=False,
+        )
+        self.mask_counter = nn.Conv2d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=False,
+        )
+        with torch.no_grad():
+            self.mask_counter.weight.fill_(1.0)
+        for param in self.mask_counter.parameters():
+            param.requires_grad = False
+
+    def forward(self, color_hint: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Encode sparse color prior into patch tokens."""
+        if color_hint.shape[1] != 3:
+            raise ValueError(f"Expected color_hint with 3 channels, got {color_hint.shape[1]}.")
+        if mask.shape[1] != 1:
+            raise ValueError(f"Expected mask with 1 channel, got {mask.shape[1]}.")
+        if color_hint.shape[-2:] != mask.shape[-2:]:
+            raise ValueError("color_hint and mask must share the same spatial resolution.")
+
+        raw_feat = self.color_proj(color_hint)
+        mask_sum = self.mask_counter(mask)
+        norm_factor = (self.patch_size ** 2) / (mask_sum + self.eps)
+        feat = raw_feat * norm_factor
+        return feat.flatten(2).transpose(1, 2)
+
+
+class MaskGuidedColorHintBlock(nn.Module):
+    """Encode RGB+mask color hints into a ControlNet spatial hint feature."""
+
+    def __init__(self, patch_size: int, embed_dim: int, dims: int = 2) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed = MaskGuidedEmbedding(patch_size=patch_size, embed_dim=embed_dim)
+        self.post_norm = nn.LayerNorm(embed_dim)
+        self.post_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.out = zero_module(conv_nd(dims, embed_dim, embed_dim, 3, padding=1))
+
+    def forward(self, hint_input: torch.Tensor) -> torch.Tensor:
+        if hint_input.shape[1] != 4:
+            raise ValueError(
+                f"Expected color hint with 4 channels (RGB + mask), got {hint_input.shape[1]}."
+            )
+        color_hint, mask = hint_input[:, :3], hint_input[:, 3:4]
+        tokens = self.embed(color_hint=color_hint, mask=mask)
+        tokens = self.post_proj(self.post_norm(tokens))
+
+        height, width = color_hint.shape[-2:]
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                "Color hint spatial size must be divisible by color_hint_patch_size."
+            )
+        patch_h = height // self.patch_size
+        patch_w = width // self.patch_size
+        feature = tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], patch_h, patch_w)
+        return self.out(feature)
+
+
 class ControlNet(nn.Module):
     def __init__(
             self,
@@ -75,6 +150,8 @@ class ControlNet(nn.Module):
             num_attention_blocks=None,
             disable_middle_self_attn=False,
             use_linear_in_transformer=False,
+            color_hint_channels=0,
+            color_hint_patch_size=8,
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -99,6 +176,8 @@ class ControlNet(nn.Module):
         self.image_size = image_size
         self.in_channels = in_channels
         self.model_channels = model_channels
+        self.color_hint_channels = color_hint_channels
+        self.color_hint_patch_size = color_hint_patch_size
         if isinstance(num_res_blocks, int):
             self.num_res_blocks = len(channel_mult) * [num_res_blocks]
         else:
@@ -144,24 +223,33 @@ class ControlNet(nn.Module):
         )
         self.zero_convs = nn.ModuleList([self.make_zero_conv(model_channels)])
 
-        self.input_hint_block = TimestepEmbedSequential(
-            conv_nd(dims, hint_channels, 16, 3, padding=1),
-            nn.SiLU(),
-            conv_nd(dims, 16, 16, 3, padding=1),
-            nn.SiLU(),
-            conv_nd(dims, 16, 32, 3, padding=1, stride=2),
-            nn.SiLU(),
-            conv_nd(dims, 32, 32, 3, padding=1),
-            nn.SiLU(),
-            conv_nd(dims, 32, 96, 3, padding=1, stride=2),
-            nn.SiLU(),
-            conv_nd(dims, 96, 96, 3, padding=1),
-            nn.SiLU(),
-            conv_nd(dims, 96, 256, 3, padding=1, stride=2),
-            nn.SiLU(),
-            zero_module(conv_nd(dims, 256, model_channels, 3, padding=1))
-        )
-
+        # self.input_hint_block = TimestepEmbedSequential(
+        #     conv_nd(dims, hint_channels, 16, 3, padding=1),
+        #     nn.SiLU(),
+        #     conv_nd(dims, 16, 16, 3, padding=1),
+        #     nn.SiLU(),
+        #     conv_nd(dims, 16, 32, 3, padding=1, stride=2),
+        #     nn.SiLU(),
+        #     conv_nd(dims, 32, 32, 3, padding=1),
+        #     nn.SiLU(),
+        #     conv_nd(dims, 32, 96, 3, padding=1, stride=2),
+        #     nn.SiLU(),
+        #     conv_nd(dims, 96, 96, 3, padding=1),
+        #     nn.SiLU(),
+        #     conv_nd(dims, 96, 256, 3, padding=1, stride=2),
+        #     nn.SiLU(),
+        #     zero_module(conv_nd(dims, 256, model_channels, 3, padding=1))
+        # )
+        self.input_hint_block = self.make_hint_block(hint_channels, model_channels)
+        self.input_color_hint_block = None
+        if color_hint_channels > 0:
+            if color_hint_channels != 4:
+                raise ValueError("color_hint_channels must be 4 for RGB + mask color hints.")
+            self.input_color_hint_block = MaskGuidedColorHintBlock(
+                patch_size=color_hint_patch_size,
+                embed_dim=model_channels,
+                dims=dims,
+            )
         self._feature_size = model_channels
         input_block_chans = [model_channels]
         ch = model_channels
@@ -278,14 +366,41 @@ class ControlNet(nn.Module):
         self.middle_block_out = self.make_zero_conv(ch)
         self._feature_size += ch
 
+    def make_hint_block(self, hint_channels, model_channels):
+        return TimestepEmbedSequential(
+            conv_nd(self.dims, hint_channels, 16, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(self.dims, 16, 16, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(self.dims, 16, 32, 3, padding=1, stride=2),
+            nn.SiLU(),
+            conv_nd(self.dims, 32, 32, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(self.dims, 32, 96, 3, padding=1, stride=2),
+            nn.SiLU(),
+            conv_nd(self.dims, 96, 96, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(self.dims, 96, 256, 3, padding=1, stride=2),
+            nn.SiLU(),
+            zero_module(conv_nd(self.dims, 256, model_channels, 3, padding=1))
+        )
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
 
-    def forward(self, x, hint, timesteps, context, **kwargs):
+    def forward(self, x, hint, timesteps, context, color_hint=None, **kwargs):
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
-        guided_hint = self.input_hint_block(hint, emb, context)
+        guided_hint = None
+        if hint is not None:
+            guided_hint = self.input_hint_block(hint, emb, context)
+        if color_hint is not None:
+            if self.input_color_hint_block is None:
+                raise ValueError(
+                    "ControlNet received color_hint, but color_hint_channels was not configured."
+                )
+            guided_color_hint = self.input_color_hint_block(color_hint)
+            guided_hint = guided_color_hint if guided_hint is None else guided_hint + guided_color_hint
 
         outs = []
 
@@ -293,6 +408,11 @@ class ControlNet(nn.Module):
         for module, zero_conv in zip(self.input_blocks, self.zero_convs):
             if guided_hint is not None:
                 h = module(h, emb, context)
+                if guided_hint.shape[-2:] != h.shape[-2:]:
+                    raise ValueError(
+                        "Guided hint spatial size must match the first ControlNet block output. "
+                        "Check hint resolution and color_hint_patch_size."
+                    )
                 h += guided_hint
                 guided_hint = None
             else:
@@ -307,34 +427,61 @@ class ControlNet(nn.Module):
 
 class ControlLDM(LatentDiffusion):
 
-    def __init__(self, control_stage_config, control_key, only_mid_control, *args, **kwargs):
+    def __init__(self, control_stage_config, control_key, only_mid_control, color_hint_key=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.control_model = instantiate_from_config(control_stage_config)
         self.control_key = control_key
+        self.color_hint_key = color_hint_key
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
+
+    def _prepare_control_tensor(self, tensor, bs=None):
+        if bs is not None:
+            tensor = tensor[:bs]
+        tensor = tensor.to(self.device)
+        if tensor.dim() != 4:
+            raise ValueError(f"Expected a 4D control tensor, got shape {tuple(tensor.shape)}.")
+        if tensor.shape[1] not in (1, 3, 4) and tensor.shape[-1] in (1, 3, 4):
+            tensor = einops.rearrange(tensor, 'b h w c -> b c h w')
+        return tensor.to(memory_format=torch.contiguous_format).float()
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
         x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
-        control = batch[self.control_key]
-        if bs is not None:
-            control = control[:bs]
-        control = control.to(self.device)
-        control = einops.rearrange(control, 'b h w c -> b c h w')
-        control = control.to(memory_format=torch.contiguous_format).float()
-        return x, dict(c_crossattn=[c], c_concat=[control])
+        # control = batch[self.control_key]
+        # if bs is not None:
+        #     control = control[:bs]
+        # control = control.to(self.device)
+        # control = einops.rearrange(control, 'b h w c -> b c h w')
+        # control = control.to(memory_format=torch.contiguous_format).float()
+        # return x, dict(c_crossattn=[c], c_concat=[control])
+        control = self._prepare_control_tensor(batch[self.control_key], bs=bs)
+        cond = dict(c_crossattn=[c], c_concat=[control])
+        if self.color_hint_key is not None:
+            cond["c_color_hint"] = [self._prepare_control_tensor(batch[self.color_hint_key], bs=bs)]
+        return x, cond
+
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
         cond_txt = torch.cat(cond['c_crossattn'], 1)
+        cond_hint = cond.get('c_concat')
+        cond_color_hint = cond.get('c_color_hint')
+        hint = None if cond_hint is None else torch.cat(cond_hint, 1)
+        color_hint = None if cond_color_hint is None else torch.cat(cond_color_hint, 1)
 
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+            control = self.control_model(
+                x=x_noisy,
+                hint=hint,
+                color_hint=color_hint,
+                timesteps=t,
+                context=cond_txt
+            )
             control = [c * scale for c, scale in zip(control, self.control_scales)]
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
 
@@ -355,10 +502,15 @@ class ControlLDM(LatentDiffusion):
         log = dict()
         z, c = self.get_input(batch, self.first_stage_key, bs=N)
         c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+        color_hint = c.get("c_color_hint", [None])[0]
+        if color_hint is not None:
+            color_hint = color_hint[:N]
         N = min(z.shape[0], N)
         n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
         log["control"] = c_cat * 2.0 - 1.0
+        if color_hint is not None:
+            log["color_hint"] = color_hint * 2.0 - 1.0
         log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
 
         if plot_diffusion_rows:
@@ -381,7 +533,10 @@ class ControlLDM(LatentDiffusion):
 
         if sample:
             # get denoise row
-            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            sample_cond = {"c_concat": [c_cat], "c_crossattn": [c]}
+            if color_hint is not None:
+                sample_cond["c_color_hint"] = [color_hint]
+            samples, z_denoise_row = self.sample_log(cond=sample_cond,
                                                      batch_size=N, ddim=use_ddim,
                                                      ddim_steps=ddim_steps, eta=ddim_eta)
             x_samples = self.decode_first_stage(samples)
@@ -394,7 +549,11 @@ class ControlLDM(LatentDiffusion):
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            cfg_cond = {"c_concat": [c_cat], "c_crossattn": [c]}
+            if color_hint is not None:
+                uc_full["c_color_hint"] = [color_hint]
+                cfg_cond["c_color_hint"] = [color_hint]
+            samples_cfg, _ = self.sample_log(cond=cfg_cond,
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
