@@ -2,6 +2,7 @@ import einops
 import torch
 import torch as th
 import torch.nn as nn
+import copy
 
 from ldm.modules.diffusionmodules.util import (
     conv_nd,
@@ -82,10 +83,15 @@ class MaskGuidedEmbedding(nn.Module):
         if color_hint.shape[-2:] != mask.shape[-2:]:
             raise ValueError("color_hint and mask must share the same spatial resolution.")
 
-        raw_feat = self.color_proj(color_hint)
+        # raw_feat = self.color_proj(color_hint)
+        masked_color = color_hint * mask
+        raw_feat = self.color_proj(masked_color)
         mask_sum = self.mask_counter(mask)
-        norm_factor = (self.patch_size ** 2) / (mask_sum + self.eps)
-        feat = raw_feat * norm_factor
+        # norm_factor = (self.patch_size ** 2) / (mask_sum + self.eps)
+        # feat = raw_feat * norm_factor
+        valid_mask = (mask_sum > self.eps).to(raw_feat.dtype)
+        norm_factor = (self.patch_size ** 2) / mask_sum.clamp_min(self.eps)
+        feat = raw_feat * norm_factor * valid_mask
         return feat.flatten(2).transpose(1, 2)
 
 
@@ -242,6 +248,10 @@ class ControlNet(nn.Module):
         # )
         self.input_hint_block = self.make_hint_block(hint_channels, model_channels)
         self.input_color_hint_block = None
+        self.color_input_blocks = None
+        self.color_zero_convs = None
+        self.color_middle_block = None
+        self.color_middle_block_out = None
         if color_hint_channels > 0:
             if color_hint_channels != 4:
                 raise ValueError("color_hint_channels must be 4 for RGB + mask color hints.")
@@ -365,6 +375,11 @@ class ControlNet(nn.Module):
         )
         self.middle_block_out = self.make_zero_conv(ch)
         self._feature_size += ch
+        if self.input_color_hint_block is not None:
+            self.color_input_blocks = copy.deepcopy(self.input_blocks)
+            self.color_zero_convs = copy.deepcopy(self.zero_convs)
+            self.color_middle_block = copy.deepcopy(self.middle_block)
+            self.color_middle_block_out = copy.deepcopy(self.middle_block_out)
 
     def make_hint_block(self, hint_channels, model_channels):
         return TimestepEmbedSequential(
@@ -387,25 +402,14 @@ class ControlNet(nn.Module):
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
 
-    def forward(self, x, hint, timesteps, context, color_hint=None, **kwargs):
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
-        emb = self.time_embed(t_emb)
-
-        guided_hint = None
-        if hint is not None:
-            guided_hint = self.input_hint_block(hint, emb, context)
-        if color_hint is not None:
-            if self.input_color_hint_block is None:
-                raise ValueError(
-                    "ControlNet received color_hint, but color_hint_channels was not configured."
-                )
-            guided_color_hint = self.input_color_hint_block(color_hint)
-            guided_hint = guided_color_hint if guided_hint is None else guided_hint + guided_color_hint
-
+    def _forward_control_branch(
+            self, x, guided_hint, emb, context,
+            input_blocks, zero_convs, middle_block, middle_block_out
+    ):
         outs = []
 
         h = x.type(self.dtype)
-        for module, zero_conv in zip(self.input_blocks, self.zero_convs):
+        for module, zero_conv in zip(input_blocks, zero_convs):
             if guided_hint is not None:
                 h = module(h, emb, context)
                 if guided_hint.shape[-2:] != h.shape[-2:]:
@@ -419,10 +423,48 @@ class ControlNet(nn.Module):
                 h = module(h, emb, context)
             outs.append(zero_conv(h, emb, context))
 
-        h = self.middle_block(h, emb, context)
-        outs.append(self.middle_block_out(h, emb, context))
+            h = middle_block(h, emb, context)
+            outs.append(middle_block_out(h, emb, context))
+            return outs
 
-        return outs
+        def _merge_control_residuals(self, control_residuals):
+            if not control_residuals:
+                raise ValueError("ControlNet requires at least one guided branch input.")
+            merged = control_residuals[0]
+            for residuals in control_residuals[1:]:
+                merged = [base + extra for base, extra in zip(merged, residuals)]
+            return merged
+
+        def forward(self, x, hint, timesteps, context, color_hint=None, **kwargs):
+            t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+            emb = self.time_embed(t_emb)
+
+            control_residuals = []
+            if hint is not None:
+                guided_hint = self.input_hint_block(hint, emb, context)
+                control_residuals.append(
+                    self._forward_control_branch(
+                        x, guided_hint, emb, context,
+                        self.input_blocks, self.zero_convs,
+                        self.middle_block, self.middle_block_out
+                    )
+                )
+
+            if color_hint is not None:
+                if self.input_color_hint_block is None:
+                    raise ValueError(
+                        "ControlNet received color_hint, but color_hint_channels was not configured."
+                    )
+                guided_color_hint = self.input_color_hint_block(color_hint)
+                control_residuals.append(
+                    self._forward_control_branch(
+                        x, guided_color_hint, emb, context,
+                        self.color_input_blocks, self.color_zero_convs,
+                        self.color_middle_block, self.color_middle_block_out
+                    )
+                )
+
+            return self._merge_control_residuals(control_residuals)
 
 
 class ControlLDM(LatentDiffusion):
@@ -500,9 +542,10 @@ class ControlLDM(LatentDiffusion):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, c = self.get_input(batch, self.first_stage_key, bs=N)
-        c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
-        color_hint = c.get("c_color_hint", [None])[0]
+        z, cond = self.get_input(batch, self.first_stage_key, bs=N)
+        c_cat = cond["c_concat"][0][:N]
+        c = cond["c_crossattn"][0][:N]
+        color_hint = cond.get("c_color_hint", [None])[0]
         if color_hint is not None:
             color_hint = color_hint[:N]
         N = min(z.shape[0], N)

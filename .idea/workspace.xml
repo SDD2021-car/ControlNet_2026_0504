@@ -2,11 +2,9 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="c42843c2-839f-4f20-87ba-a1fcd3b7f48f" name="变更" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/deployment.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/deployment.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/models/cldm_v15.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/models/cldm_v15.yaml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/cldm/cldm.py" beforeDir="false" afterPath="$PROJECT_DIR$/cldm/cldm.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/tutorial_dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/tutorial_dataset.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tutorial_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/tutorial_train.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -53,7 +51,7 @@
       <workItem from="1778025101350" duration="337000" />
       <workItem from="1778025548079" duration="121000" />
       <workItem from="1778026078440" duration="2544000" />
-      <workItem from="1778075393388" duration="6709000" />
+      <workItem from="1778075393388" duration="9192000" />
     </task>
     <servers />
   </component>

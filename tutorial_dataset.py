@@ -49,15 +49,42 @@ class MyDataset(Dataset):
     #     # 根据索引获取单个数据样本，PyTorch DataLoader会调用这个方法
     #     # 从数据列表中获取指定索引的数据项
     #     item = self.data[idx]
-    def _resolve_path(self, root, filename):
+    def _resolve_path(self, root, filename, fallback_to_basename=False):
         if filename is None:
             return None
         if os.path.isabs(filename):
             return filename
         if root is None:
             return filename
-        return os.path.join(root, filename)
+        # return os.path.join(root, filename)
+        normalized_filename = os.path.normpath(filename)
+        filename_parts = normalized_filename.split(os.sep)
+        root_basename = os.path.basename(os.path.normpath(root))
+        if filename_parts and filename_parts[0] == root_basename:
+            normalized_filename = (
+                os.path.join(*filename_parts[1:]) if len(filename_parts) > 1 else ''
+            )
 
+        resolved_path = os.path.join(root, normalized_filename)
+        basename_path = os.path.join(root, os.path.basename(normalized_filename))
+        if (
+            fallback_to_basename
+            and basename_path != resolved_path
+            and not os.path.exists(resolved_path)
+        ):
+            return basename_path
+
+        return resolved_path
+
+    def _get_first_available(self, item, keys, label):
+        for key in keys:
+            value = item.get(key)
+            if value is not None:
+                return value
+        raise KeyError(
+            f"Dataset item is missing {label}. Expected one of {keys}, "
+            f"but found keys {list(item.keys())}."
+        )
     def _read_rgb(self, path, label):
         image = cv2.imread(path, cv2.IMREAD_COLOR)
         if image is None:
@@ -75,9 +102,12 @@ class MyDataset(Dataset):
     def _load_color_hint(self, item, source_filename):
         color_hint_filename = item.get('color_hint', source_filename)
         mask_filename = item.get('mask', color_hint_filename)
-        color_hint_path = self._resolve_path(self.color_hint_root, color_hint_filename)
-        mask_path = self._resolve_path(self.mask_root, mask_filename)
-
+        color_hint_path = self._resolve_path(
+            self.color_hint_root, color_hint_filename, fallback_to_basename=True
+        )
+        mask_path = self._resolve_path(
+            self.mask_root, mask_filename, fallback_to_basename=True
+        )
         color_hint = self._read_rgb(color_hint_path, 'color_hint').astype(np.float32) / 255.0
         mask = self._read_mask(mask_path)[..., None]
         return np.concatenate([color_hint, mask], axis=2).astype(np.float32)
@@ -85,10 +115,20 @@ class MyDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
 
-        source_filename = item['trainA']
-        target_filename = item['trainB']
-        prompt = item.get('prompt', self.default_prompt)
-
+        # source_filename = item['trainA']
+        # target_filename = item['trainB']
+        # prompt = item.get('prompt', self.default_prompt)
+        source_filename = self._get_first_available(
+            item,
+            ('trainA', 'conditioning_image_file_name', 'conditioning_image', 'source'),
+            'source image filename',
+        )
+        target_filename = self._get_first_available(
+            item,
+            ('trainB', 'file_name', 'target'),
+            'target image filename',
+        )
+        prompt = item.get('prompt', item.get('text', self.default_prompt))
         source = self._read_rgb(self._resolve_path(self.source_root, source_filename), 'source')
         target = self._read_rgb(self._resolve_path(self.target_root, target_filename), 'target')
 
