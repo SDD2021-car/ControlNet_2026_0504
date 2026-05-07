@@ -20,9 +20,23 @@ only_mid_control = False
 
 # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
 model = create_model(config_path).cpu()
-missing_keys, unexpected_keys = model.load_state_dict(load_state_dict(resume_path, location='cpu'), strict=False)
+state_dict = load_state_dict(resume_path, location='cpu')
+missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 print(f'Missing keys when loading checkpoint: {missing_keys}')
 print(f'Unexpected keys when loading checkpoint: {unexpected_keys}')
+color_branch_prefixes = (
+    'control_model.color_input_blocks.',
+    'control_model.color_zero_convs.',
+    'control_model.color_middle_block.',
+    'control_model.color_middle_block_out.',
+)
+if not any(key.startswith(color_branch_prefixes) for key in state_dict):
+    initialized_color_branch = model.control_model.initialize_color_branch_from_control_branch()
+    if initialized_color_branch:
+        print(
+            'Initialized newly added color ControlNet branch from the loaded hint branch. '
+            'It will be included in future ModelCheckpoint files.'
+        )
 model.learning_rate = learning_rate
 model.sd_locked = sd_locked
 model.only_mid_control = only_mid_control

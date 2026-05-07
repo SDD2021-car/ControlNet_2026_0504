@@ -934,6 +934,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="yjy@10.104.6.25:2200 (84)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="yjy@10.104.6.25:2200 (9)">
         <serverdata>
           <mappings>

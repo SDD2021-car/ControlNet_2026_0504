@@ -381,6 +381,18 @@ class ControlNet(nn.Module):
             self.color_middle_block = copy.deepcopy(self.middle_block)
             self.color_middle_block_out = copy.deepcopy(self.middle_block_out)
 
+
+    def initialize_color_branch_from_control_branch(self):
+        if self.input_color_hint_block is None:
+            return False
+
+        self.color_input_blocks.load_state_dict(self.input_blocks.state_dict())
+        self.color_zero_convs.load_state_dict(self.zero_convs.state_dict())
+        self.color_middle_block.load_state_dict(self.middle_block.state_dict())
+        self.color_middle_block_out.load_state_dict(self.middle_block_out.state_dict())
+        return True
+
+
     def make_hint_block(self, hint_channels, model_channels):
         return TimestepEmbedSequential(
             conv_nd(self.dims, hint_channels, 16, 3, padding=1),
@@ -423,48 +435,48 @@ class ControlNet(nn.Module):
                 h = module(h, emb, context)
             outs.append(zero_conv(h, emb, context))
 
-            h = middle_block(h, emb, context)
-            outs.append(middle_block_out(h, emb, context))
-            return outs
+        h = middle_block(h, emb, context)
+        outs.append(middle_block_out(h, emb, context))
+        return outs
 
-        def _merge_control_residuals(self, control_residuals):
-            if not control_residuals:
-                raise ValueError("ControlNet requires at least one guided branch input.")
-            merged = control_residuals[0]
-            for residuals in control_residuals[1:]:
-                merged = [base + extra for base, extra in zip(merged, residuals)]
-            return merged
+    def _merge_control_residuals(self, control_residuals):
+        if not control_residuals:
+            raise ValueError("ControlNet requires at least one guided branch input.")
+        merged = control_residuals[0]
+        for residuals in control_residuals[1:]:
+            merged = [base + extra for base, extra in zip(merged, residuals)]
+        return merged
 
-        def forward(self, x, hint, timesteps, context, color_hint=None, **kwargs):
-            t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
-            emb = self.time_embed(t_emb)
+    def forward(self, x, hint, timesteps, context, color_hint=None, **kwargs):
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
 
-            control_residuals = []
-            if hint is not None:
-                guided_hint = self.input_hint_block(hint, emb, context)
-                control_residuals.append(
-                    self._forward_control_branch(
-                        x, guided_hint, emb, context,
-                        self.input_blocks, self.zero_convs,
-                        self.middle_block, self.middle_block_out
-                    )
+        control_residuals = []
+        if hint is not None:
+            guided_hint = self.input_hint_block(hint, emb, context)
+            control_residuals.append(
+                self._forward_control_branch(
+                    x, guided_hint, emb, context,
+                    self.input_blocks, self.zero_convs,
+                    self.middle_block, self.middle_block_out
                 )
+            )
 
-            if color_hint is not None:
-                if self.input_color_hint_block is None:
-                    raise ValueError(
-                        "ControlNet received color_hint, but color_hint_channels was not configured."
-                    )
-                guided_color_hint = self.input_color_hint_block(color_hint)
-                control_residuals.append(
-                    self._forward_control_branch(
-                        x, guided_color_hint, emb, context,
-                        self.color_input_blocks, self.color_zero_convs,
-                        self.color_middle_block, self.color_middle_block_out
-                    )
+        if color_hint is not None:
+            if self.input_color_hint_block is None:
+                raise ValueError(
+                    "ControlNet received color_hint, but color_hint_channels was not configured."
                 )
+            guided_color_hint = self.input_color_hint_block(color_hint)
+            control_residuals.append(
+                self._forward_control_branch(
+                    x, guided_color_hint, emb, context,
+                    self.color_input_blocks, self.color_zero_convs,
+                    self.color_middle_block, self.color_middle_block_out
+                )
+            )
 
-            return self._merge_control_residuals(control_residuals)
+        return self._merge_control_residuals(control_residuals)
 
 
 class ControlLDM(LatentDiffusion):
